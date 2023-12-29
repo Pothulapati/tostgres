@@ -17,10 +17,10 @@ func main() {
 	}
 	defer c.Close()
 
-	w := worker.New(c, "hello-world", worker.Options{})
+	w := worker.New(c, "default", worker.Options{})
 
-	w.RegisterWorkflow(tcWorkflow.Workflow)
-	var doActivities *activities.DoActivities
+	w.RegisterWorkflow(tcWorkflow.CreateTostgres)
+	doActivities := activities.NewDoActivities()
 	w.RegisterActivity(doActivities)
 
 	err = w.Run(worker.InterruptCh())

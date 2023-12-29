@@ -3,19 +3,29 @@ package activities
 import (
 	"context"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/digitalocean/godo"
 	"golang.org/x/oauth2"
 )
 
 type DoActivities struct {
+	token string
+}
+
+func NewDoActivities() *DoActivities {
+	token := os.Getenv("DO_TOKEN")
+	return &DoActivities{
+		token: token,
+	}
 }
 
 // SpinUpDroplet spins up a DigitalOcean droplet
-func (d *DoActivities) SpinUpDroplet(token string, dropletName string, region string, size string, image string) (string, error) {
+func (d *DoActivities) SpinUpDroplet(dropletName string, region, password string) (int, error) {
 	ctx := context.TODO()
 	oauthClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
+		&oauth2.Token{AccessToken: d.token},
 	))
 
 	client := godo.NewClient(oauthClient)
@@ -23,54 +33,33 @@ func (d *DoActivities) SpinUpDroplet(token string, dropletName string, region st
 	createRequest := &godo.DropletCreateRequest{
 		Name:   dropletName,
 		Region: region,
-		Size:   size,
+		Size:   "s-1vcpu-1gb",
 		Image: godo.DropletCreateImage{
-			Slug: image,
+			Slug: "ubuntu-23-10-x64",
 		},
-		UserData: `#cloud-config
-		package_upgrade: true
-		packages:
-			- docker.io
-		write_files:
-			- path: /etc/systemd/system/postgres.service
-				content: |
-					[Unit]
-					Description=PostgreSQL Container
-					After=docker.service
-					Requires=docker.service
-					
-					[Service]
-					Restart=always
-					ExecStartPre=-/usr/bin/docker stop postgres
-					ExecStartPre=-/usr/bin/docker rm postgres
-					ExecStart=/usr/bin/docker run --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=mysecretpassword -d postgres
-					ExecStop=/usr/bin/docker stop postgres
-					
-					[Install]
-					WantedBy=multi-user.target
-		runcmd:
-			- systemctl daemon-reload
-			- systemctl enable --now postgres`,
+		UserData: fmt.Sprintf(`#!/bin/bash
+
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+
+# Run Postgres as a Docker container
+docker run -d --name postgres -p 5432:5432 -e POSTGRES_USER=%s -e POSTGRES_DB=%s -e POSTGRES_PASSWORD=%s postgres`, dropletName, dropletName, password),
 	}
 
 	newDroplet, _, err := client.Droplets.Create(ctx, createRequest)
 	if err != nil {
-		return "", fmt.Errorf("failed to create droplet: %w", err)
+		return 0, fmt.Errorf("failed to create droplet: %w", err)
 	}
 
-	ipv4, err := newDroplet.PublicIPv4()
-	if err != nil {
-		return "", fmt.Errorf("failed to get droplet IP address: %w", err)
-	}
-
-	return ipv4, nil
+	return newDroplet.ID, nil
 }
 
 // UpdateDNS updates the DNS record to point to the given IP address
-func (d *DoActivities) UpdateDNS(token string, domainName string, recordName string, ipAddress string) error {
+func (d *DoActivities) UpdateDNS(domainName string, recordName string, ipAddress string) error {
 	ctx := context.TODO()
 	oauthClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
+		&oauth2.Token{AccessToken: d.token},
 	))
 
 	client := godo.NewClient(oauthClient)
@@ -80,31 +69,47 @@ func (d *DoActivities) UpdateDNS(token string, domainName string, recordName str
 		return fmt.Errorf("failed to get domain: %w", err)
 	}
 
-	records, _, err := client.Domains.Records(ctx, domain.Name, nil)
-	if err != nil {
-		return fmt.Errorf("failed to get domain records: %w", err)
-	}
-
-	var recordID int
-	for _, record := range records {
-		if record.Name == recordName {
-			recordID = record.ID
-			break
-		}
-	}
-
-	if recordID == 0 {
-		return fmt.Errorf("record not found")
-	}
-
-	updateRequest := &godo.DomainRecordEditRequest{
+	createRequest := &godo.DomainRecordEditRequest{
+		Type: "A",
+		Name: recordName,
 		Data: ipAddress,
+		TTL:  35,
 	}
 
-	_, _, err = client.Domains.EditRecord(ctx, domain.Name, recordID, updateRequest)
+	_, _, err = client.Domains.CreateRecord(ctx, domain.Name, createRequest)
 	if err != nil {
 		return fmt.Errorf("failed to update DNS record: %w", err)
 	}
 
 	return nil
+}
+
+// waitForDroplet waits until the droplet is ready
+func (d *DoActivities) WaitForDroplet(ctx context.Context, dropletID int) (string, error) {
+	oauthClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: d.token},
+	))
+
+	client := godo.NewClient(oauthClient)
+
+	var ipv4 string
+	for {
+		droplet, _, err := client.Droplets.Get(ctx, dropletID)
+		if err != nil {
+			return "", fmt.Errorf("failed to get droplet: %w", err)
+		}
+
+		ipv4, err = droplet.PublicIPv4()
+		if err != nil {
+			return "", err
+		}
+
+		if droplet.Status == "active" && err == nil {
+			break
+		}
+
+		time.Sleep(time.Second * 10)
+	}
+
+	return ipv4, nil
 }
